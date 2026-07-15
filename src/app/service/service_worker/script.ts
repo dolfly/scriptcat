@@ -48,6 +48,9 @@ import { initRegularUpdateCheck, watchRegularUpdateCheck } from "./regular_updat
 import { parseSkillScriptMetadata } from "@App/pkg/utils/skill_script";
 import { TempStorageDAO, TempStorageItemType } from "@App/app/repo/tempStorage";
 import { EnableAgent } from "@App/app/const";
+import { TrashScriptDAO } from "@App/app/repo/trash_script";
+import type { TrashScript } from "@App/app/repo/trash_script";
+import { SubscribeDAO } from "@App/app/repo/subscribe";
 
 export type TCheckScriptUpdateOption = Partial<
   { checkType: "user"; noUpdateCheck?: number } | ({ checkType: "system" } & Record<string, any>)
@@ -69,11 +72,18 @@ export type TScriptInstallReturn = {
   updatetime: number | undefined; // 实际生效的更新时间（时间戳，毫秒）
 };
 
+export type TRestoreResult = {
+  restored: string[];
+  conflicts: { uuid: string; name: string }[];
+};
+
 export class ScriptService {
   logger: Logger;
   scriptCodeDAO: ScriptCodeDAO = new ScriptCodeDAO();
   localStorageDAO: LocalStorageDAO = new LocalStorageDAO();
   compiledResourceDAO: CompiledResourceDAO = new CompiledResourceDAO();
+  trashScriptDAO: TrashScriptDAO = new TrashScriptDAO();
+  subscribeDAO: SubscribeDAO = new SubscribeDAO();
   private readonly scriptUpdateCheck;
 
   constructor(
@@ -467,6 +477,9 @@ export class ScriptService {
       script.downloadUrl = oldScript.downloadUrl;
       script.checkUpdateUrl = oldScript.checkUpdateUrl;
     }
+    // 不变量:同一 uuid 不得同时存在于 script: 与 trashScript:。
+    // 装回来了,回收站那份即作废。同步复活 / vscode 推送 / 安装页复用回收站 uuid 均汇流至此。
+    await this.trashScriptDAO.delete(script.uuid);
     return this.scriptDAO
       .save(script)
       .then(async () => {
@@ -496,44 +509,56 @@ export class ScriptService {
       });
   }
 
+  /** 删除脚本 = 移入回收站。不销毁任何关联数据(value/资源/权限/图标/代码全部保留) */
   async deleteScript(uuid: string, deleteBy?: InstallSource) {
-    let logger = this.logger.with({ uuid });
-    const script = await this.scriptDAO.get(uuid);
-    if (!script) {
-      logger.error("script not found");
-      throw new Error("script not found");
-    }
-    logger = logger.with({ name: script.name });
-    const storageName = getStorageName(script);
-    return this.scriptDAO
-      .delete(uuid)
-      .then(async () => {
-        await this.scriptCodeDAO.delete(uuid);
-        await this.compiledResourceDAO.delete(uuid);
-        logger.info("delete success");
-        const data = [{ uuid, storageName, type: script.type, deleteBy }] as TDeleteScript[];
-        this.mq.publish("deleteScripts", data);
-        return true;
-      })
-      .catch((e) => {
-        logger.error("delete error", Logger.E(e));
-        throw e;
-      });
+    return this.deleteScripts([uuid], deleteBy);
   }
 
-  async deleteScripts(uuids: string[]) {
+  /** 删除脚本 = 移入回收站。彻底销毁走 purgeScripts */
+  async deleteScripts(uuids: string[], deleteBy: InstallSource = "user") {
     const logger = this.logger.with({ uuids });
     const scripts = (await this.scriptDAO.gets(uuids)).filter((s) => !!s);
     if (!scripts.length) {
       logger.error("scripts not found");
       throw new Error("scripts not found");
     }
-    return this.scriptDAO
+    const deleteTime = Date.now();
+    try {
+      // 先写回收站,成功后再删活跃表。失败的最坏结果是两张表短暂都有(可被 upsert 清理自愈),
+      // 反过来的顺序失败一次就是脚本彻底消失。
+      await Promise.all(scripts.map((script) => this.trashScriptDAO.save({ ...script, deleteTime, deleteBy })));
+      await this.scriptDAO.deletes(uuids);
+      // 编译缓存是可重建缓存(runtime.ts:394-398 取不到会自动重建),直接丢弃
+      await this.compiledResourceDAO.deletes(uuids);
+      logger.info("trash success");
+      const data = scripts.map((script) => ({
+        uuid: script.uuid,
+        storageName: getStorageName(script),
+        type: script.type,
+        deleteBy,
+      })) as TDeleteScript[];
+      this.mq.publish<TDeleteScript[]>("trashScripts", data);
+      return true;
+    } catch (e) {
+      logger.error("trash error", Logger.E(e));
+      throw e;
+    }
+  }
+
+  /** 彻底删除:从回收站移除并销毁全部关联数据。单条删除 / 清空回收站 / 到期自动清理共用此入口 */
+  async purgeScripts(uuids: string[]) {
+    const logger = this.logger.with({ uuids });
+    const scripts = (await this.trashScriptDAO.gets(uuids)).filter((s) => !!s);
+    if (!scripts.length) {
+      logger.error("trash scripts not found");
+      throw new Error("trash scripts not found");
+    }
+    return this.trashScriptDAO
       .deletes(uuids)
       .then(async () => {
         await this.scriptCodeDAO.deletes(uuids);
         await this.compiledResourceDAO.deletes(uuids);
-        logger.info("delete success");
+        logger.info("purge success");
         const data = scripts.map((script) => ({
           uuid: script.uuid,
           storageName: getStorageName(script),
@@ -543,9 +568,63 @@ export class ScriptService {
         return true;
       })
       .catch((e) => {
-        logger.error("delete error", Logger.E(e));
+        logger.error("purge error", Logger.E(e));
         throw e;
       });
+  }
+
+  /** 从回收站还原脚本。同 name+namespace 已被占用者拒绝还原并回报冲突 */
+  async restoreScripts(uuids: string[]): Promise<TRestoreResult> {
+    const logger = this.logger.with({ uuids });
+    const trashed = (await this.trashScriptDAO.gets(uuids)).filter((s) => !!s);
+    if (!trashed.length) {
+      logger.error("trash scripts not found");
+      throw new Error("trash scripts not found");
+    }
+    const restored: string[] = [];
+    const conflicts: { uuid: string; name: string }[] = [];
+    for (const item of trashed) {
+      const occupied = await this.scriptDAO.findByNameAndNamespace(item.name, item.namespace);
+      if (occupied) {
+        conflicts.push({ uuid: item.uuid, name: item.name });
+        continue;
+      }
+      const { deleteTime: _deleteTime, deleteBy: _deleteBy, ...script } = item;
+      // 订阅已不存在时解除关联,否则日后重新订阅该 URL 会因脚本不在列表中而再次删除它
+      if (script.subscribeUrl && !(await this.subscribeDAO.get(script.subscribeUrl))) {
+        delete script.subscribeUrl;
+      }
+      // 先写活跃表,成功后再删回收站(同 deleteScripts 的顺序原则)
+      await this.scriptDAO.save(script);
+      await this.trashScriptDAO.delete(item.uuid);
+      restored.push(item.uuid);
+      this.mq.publish<TInstallScript>("installScript", { script, update: false, upsertBy: "user" });
+    }
+    logger.info("restore done", { restored: restored.length, conflicts: conflicts.length });
+    return { restored, conflicts };
+  }
+
+  /** 清理回收站中超过保留期的脚本。返回清理条数 */
+  async cleanupExpiredTrash(): Promise<number> {
+    const retentionDays = await this.systemConfig.getTrashRetentionDays();
+    if (!retentionDays) {
+      return 0; // 0 = 永不自动清理
+    }
+    const deadline = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+    const all = await this.trashScriptDAO.all();
+    const expired = all.filter((item) => item.deleteTime < deadline).map((item) => item.uuid);
+    if (!expired.length) {
+      return 0;
+    }
+    await this.purgeScripts(expired);
+    this.logger.info("cleanup expired trash", { count: expired.length });
+    return expired.length;
+  }
+
+  /** 读取回收站全部条目,按删除时间倒序(最近删的在前) */
+  async getTrashScripts(): Promise<TrashScript[]> {
+    const all = await this.trashScriptDAO.all();
+    return all.sort((a, b) => b.deleteTime - a.deleteTime);
   }
 
   async enableScript(param: { uuid: string; enable: boolean }) {
@@ -1487,7 +1566,11 @@ export class ScriptService {
     this.group.on("getAllScripts", this.getAllScripts.bind(this));
     this.group.on("getInstallInfo", this.getInstallInfo);
     this.group.on("install", this.installScript.bind(this));
-    this.group.on("deletes", this.deleteScripts.bind(this));
+    // 消息层会把 IGetSender 作为第二参传入，不能直接 bind：否则 sender 会落进 deleteBy
+    this.group.on("deletes", (uuids: string[]) => this.deleteScripts(uuids));
+    this.group.on("purges", this.purgeScripts.bind(this));
+    this.group.on("restores", this.restoreScripts.bind(this));
+    this.group.on("getTrashScripts", this.getTrashScripts.bind(this));
     this.group.on("enable", this.enableScript.bind(this));
     this.group.on("enables", this.enableScripts.bind(this));
     this.group.on("fetchInfo", this.fetchInfo.bind(this));
